@@ -5,9 +5,10 @@ from torch.utils.data import Dataset, DataLoader
 from transformers import AutoFeatureExtractor, WhisperModel
 import whisper
 
-from modules import load_audio, MosPredictor, denorm
+from mosaNET import MosPredictor , denorm , frame_score
 import numpy as np
 import pandas as pd
+from tqdm import tqdm
 import os
 
 
@@ -57,8 +58,9 @@ def len_data(dataloader):
             break
 
 
-#### atenção tem que ter .npy
+
 def freeze_intel_layer(self):
+    # Congelar camadas relacionadas à inteligibilidade
     for param in self.att_output_layer_intell.parameters():
         param.requires_grad = False
     
@@ -67,6 +69,64 @@ def freeze_intel_layer(self):
     
     for param in self.intellaverage_score.parameters():
         param.requires_grad = False
+
+
+        
+def train(ckpt_path, model, trainloader, optimizer, criterion, device, num_epochs):
+    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    
+    net = MosPredictor()
+    net = net.to(device)
+    
+    net.load_state_dict(torch.load(ckpt_path))
+
+    
+    PREV_VAL_LOSS = 999999999
+    orig_patience=5
+    patience = orig_patience
+
+    for epoch in range(num_epochs):
+        STEPS = 0
+
+        net.train()
+        run_loss = 0.0
+        
+        for i ,data in enumerate(tqdm(trainloader), 0):
+            inputs , lps , whisper , label_quality = data
+            inputs = inputs.to(device)
+            lps = lps.to(device)
+            whisper = whisper.to(device)
+            label_quality = label_quality.to(device)
+
+            optimizer.zero_grad()
+            output_quality , frame_quality = net(inputs, lps, whisper)
+            
+            label_frame_quality = frame_score(label_quality, frame_quality)
+
+            loss_frame_quality = criterion(frame_quality, label_frame_quality)
+
+            loss_quality = criterion(output_quality.squeeze(1) , label_quality)
+            
+            loss = loss_quality + loss_frame_quality
+            
+            loss.backward()
+            optimizer.step()
+            STEPS += 1
+            run_loss += loss.item()
+
+        print(f"Epoch {epoch+1} - Loss: {run_loss/STEPS}")
+        print(f"Epoch {epoch+1} - Loss Quality: {loss_quality.item()}")
+    
+        
+        epoch_val_loss = 0.0
+        net.eval()
+        
+        with torch.cuda.device(device):
+            torch.cuda.empty_cache()
+            torch.cuda.memory_allocated()
+            torch.cuda.synchronize() 
+    print("Treinamento concluído")
+     
 
 def main():
     parser = argparse.ArgumentParser('Fine-tuning do modelo MOSA NET+')
@@ -84,7 +144,7 @@ def main():
     
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     model = MosPredictor().to(device)
-   # model.freeze_intel_layer() #supostamente isso congela as camadas de inteligibilidade
+    model.freeze_intel_layer() #supostamente isso congela as camadas de inteligibilidade
     criterion = nn.MSELoss()
     optimizer = optim.Adam(model.parameters(), lr=1e-4)
 
